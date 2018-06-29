@@ -1,5 +1,19 @@
 import requests
+
 from redash.query_runner import BaseQueryRunner, register
+
+
+def _build_url(base_url, query):
+    query = query.strip()
+
+    if base_url is None:
+        base_url = ""
+
+    if base_url:
+        if query.find("://") > -1:
+            raise ValueError("Accepting only relative URLs to '{}'".format(base_url))
+
+    return base_url + query
 
 
 class Url(BaseQueryRunner):
@@ -27,16 +41,7 @@ class Url(BaseQueryRunner):
 
         try:
             error = None
-            query = query.strip()
-
-            if base_url is not None and base_url != "":
-                if query.find("://") > -1:
-                    return None, "Accepting only relative URLs to '%s'" % base_url
-
-            if base_url is None:
-                base_url = ""
-
-            url = base_url + query
+            url = _build_url(base_url, query)
 
             response = requests.get(url)
             response.raise_for_status()
@@ -46,12 +51,13 @@ class Url(BaseQueryRunner):
                 error = "Got empty response from '{}'.".format(url)
 
             return json_data, error
-        except requests.RequestException as e:
+        except (ValueError, requests.RequestException) as e:
             return None, str(e)
         except KeyboardInterrupt:
             error = "Query cancelled by user."
             json_data = None
 
         return json_data, error
+
 
 register(Url)
