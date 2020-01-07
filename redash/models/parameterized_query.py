@@ -1,12 +1,12 @@
 import pystache
 from functools import partial
-from flask_login import current_user
-from flask_restful import abort
 from numbers import Number
 from redash.utils import mustache_render, json_loads
 from redash.permissions import require_access, view_only
 from funcy import distinct
 from dateutil.parser import parse
+
+from six import string_types, text_type
 
 
 def _pluck_name_and_value(default_column, row):
@@ -14,33 +14,47 @@ def _pluck_name_and_value(default_column, row):
     name_column = "name" if "name" in row.keys() else default_column.lower()
     value_column = "value" if "value" in row.keys() else default_column.lower()
 
-    return {"name": row[name_column], "value": unicode(row[value_column])}
+    return {"name": row[name_column], "value": text_type(row[value_column])}
 
 
-def _load_result(query_id, should_require_access):
-    from redash.authentication.org_resolving import current_org
+def _load_result(query_id, org):
     from redash import models
 
-    query = models.Query.get_by_id_and_org(query_id, current_org)
-
-    if should_require_access:
-        require_access(query.data_source, current_user, view_only)
-
-    query_result = models.QueryResult.get_by_id_and_org(query.latest_query_data_id, current_org)
+    query = models.Query.get_by_id_and_org(query_id, org)
 
     if query.data_source:
-        require_access(query.data_source.groups, current_user, view_only)
-        query_result = models.QueryResult.get_by_id_and_org(query.latest_query_data_id, current_org)
-        return json_loads(query_result.data)
+        query_result = models.QueryResult.get_by_id_and_org(
+            query.latest_query_data_id, org
+        )
+        return query_result.data
     else:
-        abort(400, message="This query is detached from any data source. Please select a different query.")
+        raise QueryDetachedFromDataSourceError(query_id)
 
 
-def dropdown_values(query_id, should_require_access=True):
-    data = _load_result(query_id, should_require_access)
+def dropdown_values(query_id, org):
+    data = _load_result(query_id, org)
     first_column = data["columns"][0]["name"]
     pluck = partial(_pluck_name_and_value, first_column)
-    return map(pluck, data["rows"])
+    return list(map(pluck, data["rows"]))
+
+
+def join_parameter_list_values(parameters, schema):
+    updated_parameters = {}
+    for (key, value) in parameters.items():
+        if isinstance(value, list):
+            definition = next(
+                (definition for definition in schema if definition["name"] == key), {}
+            )
+            multi_values_options = definition.get("multiValuesOptions", {})
+            separator = str(multi_values_options.get("separator", ","))
+            prefix = str(multi_values_options.get("prefix", ""))
+            suffix = str(multi_values_options.get("suffix", ""))
+            updated_parameters[key] = separator.join(
+                [prefix + v + suffix for v in value]
+            )
+        else:
+            updated_parameters[key] = value
+    return updated_parameters
 
 
 def _collect_key_names(nodes):
@@ -63,10 +77,10 @@ def _collect_query_parameters(query):
 
 def _parameter_names(parameter_values):
     names = []
-    for key, value in parameter_values.iteritems():
+    for key, value in parameter_values.items():
         if isinstance(value, dict):
             for inner_key in value.keys():
-                names.append(u'{}.{}'.format(key, inner_key))
+                names.append("{}.{}".format(key, inner_key))
         else:
             names.append(key)
 
@@ -88,7 +102,7 @@ def _is_date(string):
     try:
         parse(string)
         return True
-    except ValueError:
+    except (ValueError, TypeError):
         return False
 
 
@@ -99,20 +113,31 @@ def _is_date_range(obj):
         return False
 
 
+def _is_value_within_options(value, dropdown_options, allow_list=False):
+    if isinstance(value, list):
+        return allow_list and set(map(text_type, value)).issubset(set(dropdown_options))
+    return text_type(value) in dropdown_options
+
+
 class ParameterizedQuery(object):
-    def __init__(self, template, schema=None):
+    def __init__(self, template, schema=None, org=None):
         self.schema = schema or []
+        self.org = org
         self.template = template
         self.query = template
         self.parameters = {}
 
     def apply(self, parameters):
-        invalid_parameter_names = [key for (key, value) in parameters.iteritems() if not self._valid(key, value)]
+        invalid_parameter_names = [
+            key for (key, value) in parameters.items() if not self._valid(key, value)
+        ]
         if invalid_parameter_names:
             raise InvalidParameterError(invalid_parameter_names)
         else:
             self.parameters.update(parameters)
-            self.query = mustache_render(self.template, self.parameters)
+            self.query = mustache_render(
+                self.template, join_parameter_list_values(parameters, self.schema)
+            )
 
         return self
 
@@ -120,16 +145,32 @@ class ParameterizedQuery(object):
         if not self.schema:
             return True
 
-        definition = next((definition for definition in self.schema if definition["name"] == name), None)
+        definition = next(
+            (definition for definition in self.schema if definition["name"] == name),
+            None,
+        )
 
         if not definition:
             return False
 
+        enum_options = definition.get("enumOptions")
+        query_id = definition.get("queryId")
+        allow_multiple_values = isinstance(definition.get("multiValuesOptions"), dict)
+
+        if isinstance(enum_options, string_types):
+            enum_options = enum_options.split("\n")
+
         validators = {
-            "text": lambda value: isinstance(value, basestring),
+            "text": lambda value: isinstance(value, string_types),
             "number": _is_number,
-            "enum": lambda value: value in definition["enumOptions"],
-            "query": lambda value: unicode(value) in [v["value"] for v in dropdown_values(definition["queryId"])],
+            "enum": lambda value: _is_value_within_options(
+                value, enum_options, allow_multiple_values
+            ),
+            "query": lambda value: _is_value_within_options(
+                value,
+                [v["value"] for v in dropdown_values(query_id, self.org)],
+                allow_multiple_values,
+            ),
             "date": _is_date,
             "datetime-local": _is_date,
             "datetime-with-seconds": _is_date,
@@ -144,7 +185,7 @@ class ParameterizedQuery(object):
 
     @property
     def is_safe(self):
-        text_parameters = filter(lambda p: p["type"] == "text", self.schema)
+        text_parameters = [param for param in self.schema if param["type"] == "text"]
         return not any(text_parameters)
 
     @property
@@ -159,6 +200,16 @@ class ParameterizedQuery(object):
 
 class InvalidParameterError(Exception):
     def __init__(self, parameters):
-        parameter_names = u", ".join(parameters)
-        message = u"The following parameter values are incompatible with their definitions: {}".format(parameter_names)
+        parameter_names = ", ".join(parameters)
+        message = "The following parameter values are incompatible with their definitions: {}".format(
+            parameter_names
+        )
         super(InvalidParameterError, self).__init__(message)
+
+
+class QueryDetachedFromDataSourceError(Exception):
+    def __init__(self, query_id):
+        self.query_id = query_id
+        super(QueryDetachedFromDataSourceError, self).__init__(
+            "This query is detached from any data source. Please select a different query."
+        )

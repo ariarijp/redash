@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
 
-worker() {
+celery_worker() {
   WORKERS_COUNT=${WORKERS_COUNT:-2}
-  QUEUES=${QUEUES:-queries,scheduled_queries,celery,schemas}
+  QUEUES=${QUEUES:-queries,scheduled_queries}
   WORKER_EXTRA_OPTIONS=${WORKER_EXTRA_OPTIONS:-}
 
   echo "Starting $WORKERS_COUNT workers for queues: $QUEUES..."
@@ -11,17 +11,46 @@ worker() {
 }
 
 scheduler() {
-  WORKERS_COUNT=${WORKERS_COUNT:-1}
-  QUEUES=${QUEUES:-celery}
-  SCHEDULE_DB=${SCHEDULE_DB:-celerybeat-schedule}
+  echo "Starting RQ scheduler..."
 
-  echo "Starting scheduler and $WORKERS_COUNT workers for queues: $QUEUES..."
+  exec /app/manage.py rq scheduler
+}
 
-  exec /usr/local/bin/celery worker --app=redash.worker --beat -s$SCHEDULE_DB -c$WORKERS_COUNT -Q$QUEUES -linfo --max-tasks-per-child=10 -Ofair
+dev_scheduler() {
+  echo "Starting dev RQ scheduler..."
+
+  exec watchmedo auto-restart --directory=./redash/ --pattern=*.py --recursive -- ./manage.py rq scheduler
+}
+
+worker() {
+  echo "Starting RQ worker..."
+
+  export WORKERS_COUNT=${WORKERS_COUNT:-2}
+  export QUEUES=${QUEUES:-}
+  
+  supervisord -c worker.conf
+}
+
+dev_worker() {
+  echo "Starting dev RQ worker..."
+
+  exec watchmedo auto-restart --directory=./redash/ --pattern=*.py --recursive -- ./manage.py rq worker $QUEUES
+}
+
+dev_celery_worker() {
+  WORKERS_COUNT=${WORKERS_COUNT:-2}
+  QUEUES=${QUEUES:-queries,scheduled_queries}
+
+  echo "Starting $WORKERS_COUNT workers for queues: $QUEUES..."
+
+  exec watchmedo auto-restart --directory=./redash/ --pattern=*.py --recursive -- /usr/local/bin/celery worker --app=redash.worker -c$WORKERS_COUNT -Q$QUEUES -linfo --max-tasks-per-child=10 -Ofair
 }
 
 server() {
-  exec /usr/local/bin/gunicorn -b 0.0.0.0:5000 --name redash -w${REDASH_WEB_WORKERS:-4} redash.wsgi:app
+  # Recycle gunicorn workers every n-th request. See http://docs.gunicorn.org/en/stable/settings.html#max-requests for more details.
+  MAX_REQUESTS=${MAX_REQUESTS:-1000}
+  MAX_REQUESTS_JITTER=${MAX_REQUESTS_JITTER:-100}
+  exec /usr/local/bin/gunicorn -b 0.0.0.0:5000 --name redash -w${REDASH_WEB_WORKERS:-4} redash.wsgi:app --max-requests $MAX_REQUESTS --max-requests-jitter $MAX_REQUESTS_JITTER
 }
 
 create_db() {
@@ -32,6 +61,10 @@ celery_healthcheck() {
   exec /usr/local/bin/celery inspect ping --app=redash.worker -d celery@$HOSTNAME
 }
 
+rq_healthcheck() {
+  exec /app/manage.py rq healthcheck
+}
+
 help() {
   echo "Redash Docker."
   echo ""
@@ -39,9 +72,14 @@ help() {
   echo ""
 
   echo "server -- start Redash server (with gunicorn)"
-  echo "worker -- start Celery worker"
-  echo "scheduler -- start Celery worker with a beat (scheduler) process"
+  echo "celery_worker -- start Celery worker"
+  echo "dev_celery_worker -- start Celery worker process which picks up code changes and reloads"
+  echo "worker -- start a single RQ worker"
+  echo "dev_worker -- start a single RQ worker with code reloading"
+  echo "scheduler -- start an rq-scheduler instance"
+  echo "dev_scheduler -- start an rq-scheduler instance with code reloading"
   echo "celery_healthcheck -- runs a Celery healthcheck. Useful for Docker's HEALTHCHECK mechanism."
+  echo "rq_healthcheck -- runs a RQ healthcheck that verifies that all local workers are active. Useful for Docker's HEALTHCHECK mechanism."
   echo ""
   echo "shell -- open shell"
   echo "dev_server -- start Flask development server with debugger and auto reload"
@@ -74,6 +112,30 @@ case "$1" in
   scheduler)
     shift
     scheduler
+    ;;
+  dev_scheduler)
+    shift
+    dev_scheduler
+    ;;
+  celery_worker)
+    shift
+    celery_worker
+    ;;
+  dev_celery_worker)
+    shift
+    dev_celery_worker
+    ;;
+  dev_worker)
+    shift
+    dev_worker
+    ;;
+  rq_healthcheck)
+    shift
+    rq_healthcheck
+    ;;
+  celery_healthcheck)
+    shift
+    celery_healthcheck
     ;;
   dev_server)
     export FLASK_DEBUG=1
